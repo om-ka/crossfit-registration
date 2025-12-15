@@ -1,0 +1,11 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "ARBOX_USER_EMAIL": "",
+    "ARBOX_USER_PASSWORD": "",
+    "ALERTZY_ACCOUNT_KEY": "",
+    "TZ": "Asia/Jerusalem"
+  }
+}
