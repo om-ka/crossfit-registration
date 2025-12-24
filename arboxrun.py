@@ -6,6 +6,8 @@ Timer-friendly script that logs in, waits until a target time, and registers
 for the next Sunday/Tuesday/Thursday classes at 06:00 (box 28, location 7).
 """
 
+import os
+import sys
 import time
 from datetime import datetime, time as dt_time, timedelta
 from typing import Any, Dict, Optional
@@ -175,7 +177,7 @@ def validate_inputs(date_str: str, start_time: str) -> None:
 
 def notify(title: str, message: str) -> None:
     """Send Alertzy push if a key is configured."""
-    key = getattr(config, "alertzy_account_key", None)
+    key = getattr(config, "alertzy_account_key", None) or os.environ.get("ALERTZY_ACCOUNT_KEY")
     if not key:
         return
     try:
@@ -297,8 +299,8 @@ def run_coordinated_flow() -> Dict[str, Any]:
     )
     wait_until_run_time(RUN_TIME)
 
-    email = config.user_creds.get("email")
-    password = config.user_creds.get("password")
+    email = config.user_creds.get("email") or os.environ.get("ARBOX_USER_EMAIL")
+    password = config.user_creds.get("password") or os.environ.get("ARBOX_USER_PASSWORD")
     if not email or not password:
         raise RuntimeError("Missing ARBOX_USER_EMAIL or ARBOX_USER_PASSWORD in environment.")
 
