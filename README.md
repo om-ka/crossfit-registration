@@ -3,7 +3,7 @@
 Timer-triggered Azure Function that logs into Arbox and enrolls you into the next Sunday, Tuesday, and Thursday 06:00 classes (box 28 / location 7). It sends Alertzy notifications when it starts, while waiting, and per-class success/failure.
 
 ## How it works
-- Timer trigger: every Thursday at 15:00 (cron `0 59 14 * * Thu`), defined in `TimerEnroll/function.json`.
+- Timer trigger: fires Thursdays at 11:58 and 12:58 UTC (cron `0 58 11,12 * * Thu`) and runs only when within a few minutes of 15:00 Israel time (`TimerEnroll/function.json`, `TimerEnroll/__init__.py`). This avoids DST drift and gives a 2-minute head start before the 15:00 run window.
 - At trigger time, it notifies via Alertzy, then waits until 15:00 (with “waiting” notifications every 10 seconds) before running enrollment.
 - Enrollment logic (`arboxrun.py`):
   - Targets next occurrences of Sunday, Tuesday, and Thursday.
@@ -52,5 +52,6 @@ This follows the same wait/notify/enroll flow using the default constants.
 - `lib/push_notification.py` — Alertzy helper.
 
 ## Notes
+- Python Azure Functions run on Linux; timezone is handled by the dual UTC triggers plus the TZ guard. Keep `TZ` (e.g., `Asia/Jerusalem`) set in App Settings.
 - Alerts are sent for start, waiting, and per-class success/failure when `ALERTZY_ACCOUNT_KEY` is set.
 - If you run `python arboxrun.py` directly, it follows the same wait/notify/enroll flow.
