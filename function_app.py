@@ -5,12 +5,15 @@ import azure.functions as func
 
 from arboxrun import RUN_TIME, now_with_tz, notify, parse_hhmm, run_coordinated_flow
 
-# Allow the timer to fire a few minutes before the target time; run_coordinated_flow
-# will wait until RUN_TIME exactly.
+app = func.FunctionApp()
+
+# Allow the timer to fire a few minutes before the target time; run_coordinated_flow waits until RUN_TIME.
 RUN_WINDOW_MINUTES = 5
 
 
-def main(mytimer: func.TimerRequest) -> None:  # noqa: ANN001
+@app.function_name(name="TimerEnroll")
+@app.schedule(schedule="0 58 11,12 * * Thu", arg_name="mytimer", run_on_startup=False, use_monitor=True)
+def timer_enroll(mytimer: func.TimerRequest) -> None:  # noqa: ANN001
     current = now_with_tz()
     target_dt = datetime.combine(current.date(), parse_hhmm(RUN_TIME), tzinfo=current.tzinfo)
     delta = target_dt - current
