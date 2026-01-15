@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from datetime import datetime, time as dt_time, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -35,14 +35,13 @@ MEMBERSHIP_URL_TEMPLATE = f"{API_BASE}/boxes/{{box_id}}/memberships/{{membership
 
 DEFAULT_BOX_ID = 28
 DEFAULT_LOCATION_ID = 7
-DEFAULT_START_TIME = "06:00"
+DEFAULT_START_TIME = os.environ.get("ARBOX_REGISTRATION_START_TIME") or "06:00"
 DEFAULT_MEMBERSHIP_TYPE = 1
 # Days to enroll (next occurrence of each)
 DAYS_TO_BOOK = ["sun", "tue", "thu"]
 
 # Time coordination constants (Azure Function friendly)
 RUN_TIME = "15:00"
-WAIT_NOTIFY_INTERVAL_SECONDS = 10
 
 
 def common_headers() -> Dict[str, str]:
@@ -206,26 +205,49 @@ def parse_hhmm(value: str) -> dt_time:
     return dt_time(hour=dt_obj.hour, minute=dt_obj.minute)
 
 
-def wait_until_run_time(run_time_str: str, notify_interval: int = WAIT_NOTIFY_INTERVAL_SECONDS) -> None:
-    """Wait until the configured run time, notifying every notify_interval seconds."""
+def wait_until_run_time(run_time_str: str) -> None:
+    """Wait until the configured run time with strategic notifications."""
     target_time = parse_hhmm(run_time_str)
     start = now_with_tz()
     target_dt = datetime.combine(start.date(), target_time, tzinfo=start.tzinfo)
 
-    counter = 0
+    # Send initial notification
+    notify(
+        "Arbox waiting",
+        f"Started waiting for {run_time_str}. Now {start.strftime('%H:%M:%S')} "
+        f"(target {target_dt.strftime('%H:%M:%S')})",
+    )
+
+    notified_60s = False
+    notified_5s_before = False
+
     while True:
         current = now_with_tz()
         if current >= target_dt:
             return
 
-        if counter % notify_interval == 0:
+        seconds_elapsed = (current - start).total_seconds()
+        seconds_remaining = (target_dt - current).total_seconds()
+
+        # Notify after 60 seconds of waiting
+        if not notified_60s and seconds_elapsed >= 60:
             notify(
                 "Arbox waiting",
-                f"Waiting for {run_time_str}. Now {current.strftime('%H:%M:%S')} "
+                f"Still waiting (60s elapsed). Now {current.strftime('%H:%M:%S')} "
                 f"(target {target_dt.strftime('%H:%M:%S')})",
             )
+            notified_60s = True
+
+        # Notify 5 seconds before registration
+        if not notified_5s_before and seconds_remaining <= 5:
+            notify(
+                "Arbox almost ready",
+                f"Registering in {int(seconds_remaining)}s! "
+                f"(target {target_dt.strftime('%H:%M:%S')})",
+            )
+            notified_5s_before = True
+
         time.sleep(1)
-        counter += 1
 
 
 def weekday_index(day_str: str) -> int:
@@ -249,6 +271,19 @@ def next_date_for_weekday(target_weekday: int, from_date: datetime) -> str:
         delta_days = 7
     target_date = from_date + timedelta(days=delta_days)
     return target_date.strftime("%Y-%m-%d")
+
+
+def get_days_to_book() -> List[str]:
+    try:
+        """Return configured days to book, allowing an env override (comma-separated)."""
+        env_value = os.environ.get("ARBOX_REGISTRATIPON_DAYS")
+        if env_value:
+            parsed = [day.strip() for day in env_value.split(",") if day.strip()]
+            if parsed:
+                return parsed
+    except Exception as exc:  # noqa: BLE001
+        notify(f"Error parsing ARBOX_REGISTRATIPON_DAYS: {exc}, using default values of {DEFAULT_DAYS_TO_BOOK}.")
+    return DEFAULT_DAYS_TO_BOOK
 
 
 def run_enrollment(
@@ -312,7 +347,7 @@ def run_coordinated_flow() -> Dict[str, Any]:
     # Build list of target dates for configured weekdays
     today = now_with_tz()
     targets = []
-    for day in DAYS_TO_BOOK:
+    for day in get_days_to_book():
         try:
             idx = weekday_index(day)
         except KeyError:
