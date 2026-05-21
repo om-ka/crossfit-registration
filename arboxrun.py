@@ -146,6 +146,9 @@ def fetch_class_id(
     raise RuntimeError(f"No class starting at {start_time} on {target_date} was found.")
 
 
+REGISTER_RETRY_DELAYS_SEC = [0.01, 0.1, 1.0, 2.0, 3.0]
+
+
 def register_for_class(
     schedule_id: int, membership_user_id: int, token: str, refresh_token: str
 ) -> Dict[str, Any]:
@@ -154,18 +157,34 @@ def register_for_class(
         "membership_user_id": membership_user_id,
         "extras": {"spot": None},
     }
-    resp = requests.post(REGISTER_URL, headers=auth_headers(token, refresh_token), json=payload)
 
-    if resp.status_code == 516:
-        raise RuntimeError("Class is full (status 516).")
-    if resp.status_code != 200:
+    last_error: Optional[Exception] = None
+    for attempt in range(len(REGISTER_RETRY_DELAYS_SEC) + 1):
         try:
-            error_message = resp.json().get("error", {}).get("messageToUser")
-        except Exception:  # noqa: BLE001
-            error_message = resp.text
-        raise RuntimeError(f"Registration failed ({resp.status_code}): {error_message}")
+            resp = requests.post(REGISTER_URL, headers=auth_headers(token, refresh_token), json=payload)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+        else:
+            # 516 = class full; retrying won't help.
+            if resp.status_code == 516:
+                raise RuntimeError("Class is full (status 516).")
+            if resp.status_code == 200:
+                return resp.json()
+            try:
+                error_message = resp.json().get("error", {}).get("messageToUser")
+            except Exception:  # noqa: BLE001
+                error_message = resp.text
+            last_error = RuntimeError(f"Registration failed ({resp.status_code}): {error_message}")
 
-    return resp.json()
+        if attempt < len(REGISTER_RETRY_DELAYS_SEC):
+            delay = REGISTER_RETRY_DELAYS_SEC[attempt]
+            print(
+                f"Registration attempt {attempt + 1} failed: {last_error}. "
+                f"Retrying in {int(delay * 1000)}ms."
+            )
+            time.sleep(delay)
+
+    raise last_error  # type: ignore[misc]
 
 
 def validate_inputs(date_str: str, start_time: str) -> None:
