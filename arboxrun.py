@@ -37,8 +37,14 @@ DEFAULT_BOX_ID = 28
 DEFAULT_LOCATION_ID = 7
 DEFAULT_START_TIME = os.environ.get("ARBOX_REGISTRATION_START_TIME") or "06:00"
 DEFAULT_MEMBERSHIP_TYPE = 1
-# Days to enroll (next occurrence of each)
-DAYS_TO_BOOK = ["sun", "tue", "thu"]
+# Days to enroll (next occurrence of each). Each entry is a dict with a
+# required "day" and an optional "time" (HH:MM). When "time" is omitted the
+# DEFAULT_START_TIME above is used.
+DAYS_TO_BOOK: List[Dict[str, str]] = [
+    {"day": "sun"},
+    {"day": "tue"},
+    {"day": "thu"},
+]
 
 # Time coordination constants (Azure Function friendly)
 RUN_TIME = "15:00"
@@ -292,16 +298,31 @@ def next_date_for_weekday(target_weekday: int, from_date: datetime) -> str:
     return target_date.strftime("%Y-%m-%d")
 
 
-def get_days_to_book() -> List[str]:
+def get_days_to_book() -> List[Dict[str, str]]:
+    """Return configured days to book (with optional per-day time).
+
+    Env override ARBOX_REGISTRATION_DAYS is comma-separated. Each entry is
+    either "<day>" (uses DEFAULT_START_TIME) or "<day>:HH:MM" (per-day time).
+    Example: "sun,tue:07:00,thu"
+    """
     try:
-        """Return configured days to book, allowing an env override (comma-separated)."""
-        env_value = os.environ.get("ARBOX_REGISTRATIPON_DAYS")
+        env_value = os.environ.get("ARBOX_REGISTRATION_DAYS")
         if env_value:
-            parsed = [day.strip() for day in env_value.split(",") if day.strip()]
+            parsed: List[Dict[str, str]] = []
+            for raw in env_value.split(","):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                day, _, time_str = raw.partition(":")
+                entry: Dict[str, str] = {"day": day.strip()}
+                time_str = time_str.strip()
+                if time_str:
+                    entry["time"] = time_str
+                parsed.append(entry)
             if parsed:
                 return parsed
     except Exception as exc:  # noqa: BLE001
-        notify("Arbox config error", f"Error parsing ARBOX_REGISTRATIPON_DAYS: {exc}, using default values of {DAYS_TO_BOOK}.")
+        notify("Arbox config error", f"Error parsing ARBOX_REGISTRATION_DAYS: {exc}, using default values of {DAYS_TO_BOOK}.")
     return DAYS_TO_BOOK
 
 
@@ -363,24 +384,28 @@ def run_coordinated_flow() -> Dict[str, Any]:
     token = auth["token"]
     refresh_token = auth["refresh_token"]
 
-    # Build list of target dates for configured weekdays
+    # Build list of (target_date, start_time) pairs for configured days.
     today = now_with_tz()
-    targets = []
-    for day in get_days_to_book():
+    targets: List[tuple] = []
+    for entry in get_days_to_book():
+        day = entry.get("day")
+        if not day:
+            raise ValueError(f"DAYS_TO_BOOK entry missing 'day' key: {entry!r}")
+        start_time = entry.get("time") or DEFAULT_START_TIME
         try:
             idx = weekday_index(day)
         except KeyError:
             print(f"Skipping unknown day '{day}'")
             continue
         target_date = next_date_for_weekday(idx, today)
-        targets.append(target_date)
+        targets.append((target_date, start_time))
 
     summaries = []
-    for date_str in targets:
+    for date_str, start_time in targets:
         try:
             summary = run_enrollment(
                 date_str=date_str,
-                start_time=DEFAULT_START_TIME,
+                start_time=start_time,
                 token=token,
                 refresh_token=refresh_token,
                 box_id=DEFAULT_BOX_ID,
@@ -395,7 +420,7 @@ def run_coordinated_flow() -> Dict[str, Any]:
             )
         except Exception as exc:  # noqa: BLE001
             print(f"Error registering for {date_str}: {exc}")
-            notify("Arbox run failed", f"{date_str} {DEFAULT_START_TIME}: {exc}")
+            notify("Arbox run failed", f"{date_str} {start_time}: {exc}")
 
     return {"results": summaries}
 

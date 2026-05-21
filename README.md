@@ -32,7 +32,7 @@ pip install -r requirements.txt
 - Optional: `TZ` (e.g., `Asia/Jerusalem`) or set `timezone` in `data/config.py`.
 - Optional overrides:
   - `ARBOX_REGISTRATION_START_TIME` (e.g., `06:00`)
-  - `ARBOX_REGISTRATIPON_DAYS` (comma-separated, e.g., `sun,tue,thu`)
+  - `ARBOX_REGISTRATION_DAYS` (comma-separated; each entry is `<day>` or `<day>:HH:MM`, e.g., `sun,tue:07:00,thu`)
 - Recommended for the Python v2 programming model: `AzureWebJobsFeatureFlags=EnableWorkerIndexing` (set as an App Setting in Azure and in `local.settings.json` for local runs).
 
 `local.settings.json` is provided for local runs (fill in your values).
