@@ -282,8 +282,8 @@ def get_days_to_book() -> List[str]:
             if parsed:
                 return parsed
     except Exception as exc:  # noqa: BLE001
-        notify(f"Error parsing ARBOX_REGISTRATIPON_DAYS: {exc}, using default values of {DEFAULT_DAYS_TO_BOOK}.")
-    return DEFAULT_DAYS_TO_BOOK
+        notify("Arbox config error", f"Error parsing ARBOX_REGISTRATIPON_DAYS: {exc}, using default values of {DAYS_TO_BOOK}.")
+    return DAYS_TO_BOOK
 
 
 def run_enrollment(

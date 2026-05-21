@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import datetime, timedelta
 
 import azure.functions as func
@@ -10,6 +11,9 @@ app = func.FunctionApp()
 # Allow the timer to fire a few minutes before the target time; run_coordinated_flow waits until RUN_TIME.
 RUN_WINDOW_MINUTES = 5
 
+# Set SKIP_TIME_CHECK=true to bypass the time window check (for testing)
+SKIP_TIME_CHECK = os.getenv("SKIP_TIME_CHECK", "false").lower() == "true"
+
 
 @app.function_name(name="TimerEnroll")
 @app.schedule(schedule="0 58 11,12 * * Thu", arg_name="mytimer", run_on_startup=False, use_monitor=True)
@@ -18,7 +22,7 @@ def timer_enroll(mytimer: func.TimerRequest) -> None:  # noqa: ANN001
     target_dt = datetime.combine(current.date(), parse_hhmm(RUN_TIME), tzinfo=current.tzinfo)
     delta = target_dt - current
 
-    if abs(delta) > timedelta(minutes=RUN_WINDOW_MINUTES):
+    if not SKIP_TIME_CHECK and abs(delta) > timedelta(minutes=RUN_WINDOW_MINUTES):
         logging.info(
             "Timer fired at %s (tz=%s); delta to target is %s (abs %s), outside +/-%d-minute window. Skipping.",
             current.strftime("%Y-%m-%d %H:%M:%S"),
@@ -28,6 +32,9 @@ def timer_enroll(mytimer: func.TimerRequest) -> None:  # noqa: ANN001
             RUN_WINDOW_MINUTES,
         )
         return
+
+    if SKIP_TIME_CHECK:
+        logging.info("SKIP_TIME_CHECK is enabled - bypassing time window check for testing.")
 
     try:
         summary = run_coordinated_flow()
