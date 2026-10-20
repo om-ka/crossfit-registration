@@ -10,6 +10,7 @@ from arboxrun import (
     ACTION_REGISTER,
     ACTION_SKIP,
     RUN_TIME,
+    day_command,
     format_day,
     now_with_tz,
     notify,
@@ -100,10 +101,38 @@ def slack_actions(req: func.HttpRequest, queue: func.Out[str]) -> func.HttpRespo
     return func.HttpResponse(status_code=200)
 
 
+@app.function_name(name="SlackCommands")
+@app.route(route="slack/commands", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+@app.queue_output(arg_name="queue", queue_name=SLACK_ACTIONS_QUEUE, connection="AzureWebJobsStorage")
+def slack_commands(req: func.HttpRequest, queue: func.Out[str]) -> func.HttpResponse:
+    body = req.get_body()
+    if not verify_signature(
+        req.headers.get("X-Slack-Request-Timestamp", ""), req.headers.get("X-Slack-Signature", ""), body
+    ):
+        return func.HttpResponse("invalid signature", status_code=401)
+
+    form = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+    if ALLOWED_USER_IDS and form.get("user_id") not in ALLOWED_USER_IDS:
+        return func.HttpResponse(status_code=200)
+
+    # Logging in and loading the schedule can exceed Slack's 3s limit, so answer from the worker.
+    queue.set(json.dumps({"kind": "command", "text": form.get("text", ""), "response_url": form.get("response_url")}))
+    return func.HttpResponse(status_code=200)
+
+
 @app.function_name(name="SlackActionWorker")
 @app.queue_trigger(arg_name="item", queue_name=SLACK_ACTIONS_QUEUE, connection="AzureWebJobsStorage")
 def slack_action_worker(item: func.QueueMessage) -> None:
     job = json.loads(item.get_body().decode())
+    if job.get("kind") == "command":
+        try:
+            message = day_command(job["text"])
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Slack command failed")
+            message = {"text": f"❌ {exc}"}
+        respond(job["response_url"], {"response_type": "in_channel", **message})
+        return
+
     try:
         text = register_from_button(job["value"])
     except Exception as exc:  # noqa: BLE001

@@ -483,6 +483,72 @@ def run_coordinated_flow() -> Dict[str, Any]:
     return {"results": outcome["summaries"]}
 
 
+# Registration for the next Sun-Sat week opens on Thursday at this time.
+WEEK_OPENS_WEEKDAY = 3  # Thursday
+WEEK_OPENS_TIME = "15:00"
+
+
+def open_week_end(now: datetime) -> datetime:
+    """Return the last day (Saturday) of the week currently open for registration."""
+    days_since_sunday = (now.weekday() + 1) % 7
+    sunday = (now - timedelta(days=days_since_sunday)).date()
+    opens_at = datetime.combine(
+        sunday + timedelta(days=(WEEK_OPENS_WEEKDAY + 1) % 7), parse_hhmm(WEEK_OPENS_TIME), tzinfo=now.tzinfo
+    )
+    saturday = sunday + timedelta(days=6)
+    return datetime.combine(saturday + timedelta(days=7) if now >= opens_at else saturday, dt_time(), tzinfo=now.tzinfo)
+
+
+def next_date_including_today(target_weekday: int, from_date: datetime) -> str:
+    delta_days = (target_weekday - from_date.weekday()) % 7
+    return (from_date + timedelta(days=delta_days)).strftime("%Y-%m-%d")
+
+
+def day_blocks(date_str: str, schedule: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """All classes of a day: booked, bookable (as buttons) and full."""
+    day = format_day(date_str)
+    entries = [e for e in schedule if e.get("status") == "active" and not e.get("past")]
+    if not entries:
+        return [section(f"🚫 *{day}* — no upcoming classes listed (holiday / closed?)")]
+
+    lines = [f"📅 *{day}*"]
+    lines += [f"✅ {class_label(e)} — you're booked" for e in entries if e.get("user_booked")]
+    full = [e for e in entries if not e.get("user_booked") and (e.get("free") or 0) <= 0]
+    if full:
+        lines.append("⛔ Full: " + ", ".join(class_label(e) for e in full))
+    blocks = [section("\n".join(lines))]
+
+    free = [e for e in bookable_alternatives(schedule)]
+    if free:
+        buttons = []
+        for e in free[:25]:
+            button = register_button(e, e.get("time"))
+            button["text"]["text"] = f"{class_label(e)} ({e.get('free')} free)"[:75]
+            buttons.append(button)
+        blocks.append({"type": "actions", "block_id": f"day:{date_str}", "elements": buttons})
+    return blocks
+
+
+def day_command(text: str) -> Dict[str, Any]:
+    """Handle '/arbox <day>': return a Slack message with that day's classes."""
+    arg = (text or "").strip().lower()
+    try:
+        idx = weekday_index(arg)
+    except KeyError:
+        return {"text": "Usage: `/arbox <day>`, e.g. `/arbox wed`"}
+
+    now = now_with_tz()
+    date_str = next_date_including_today(idx, now)
+    if datetime.strptime(date_str, "%Y-%m-%d").date() > open_week_end(now).date():
+        days_to_thu = (WEEK_OPENS_WEEKDAY - now.weekday()) % 7
+        opens = (now + timedelta(days=days_to_thu)).strftime("%a %d/%m")
+        return {"text": f"Registration for {format_day(date_str)} isn't open yet — it opens {opens} at {WEEK_OPENS_TIME}."}
+
+    auth = login_from_config()
+    schedule = fetch_day_schedule(date_str, auth["token"], auth["refresh_token"])
+    return {"text": f"Arbox classes {format_day(date_str)}", "blocks": day_blocks(date_str, schedule)}
+
+
 def register_from_button(value: Dict[str, Any]) -> str:
     """Handle a Slack 'register' button: book the chosen class and return a status line."""
     date_str, start_time, schedule_id = value["d"], value["t"], value["s"]
