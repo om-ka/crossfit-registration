@@ -5,10 +5,12 @@
     "FUNCTIONS_WORKER_RUNTIME": "python",
     "AzureWebJobsFeatureFlags": "EnableWorkerIndexing",
     "ARBOX_REGISTRATION_START_TIME": "",
-    "ARBOX_REGISTRATIPON_DAYS": "",
+    "ARBOX_REGISTRATION_DAYS": "",
     "ARBOX_USER_EMAIL": "",
     "ARBOX_USER_PASSWORD": "",
-    "ALERTZY_ACCOUNT_KEY": "",
+    "SLACK_BOT_TOKEN": "",
+    "SLACK_SIGNING_SECRET": "",
+    "SLACK_CHANNEL_ID": "",
     "TZ": "Asia/Jerusalem"
   }
 }

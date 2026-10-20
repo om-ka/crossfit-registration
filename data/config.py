@@ -11,7 +11,6 @@ class Config:
             'email': os.getenv('ARBOX_USER_EMAIL') or '',
             'password': os.getenv('ARBOX_USER_PASSWORD') or ''
         }
-        self.alertzy_account_key = os.getenv('ALERTZY_ACCOUNT_KEY') or ''
         self.timezone = os.getenv('TZ') or "Asia/Jerusalem"
 
 # Create global config instance
