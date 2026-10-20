@@ -1,0 +1,29 @@
+# Slack app manifest template. Don't paste this file as is: slack-setup.sh /
+# slack-setup.ps1 fill in the placeholders and write slack-manifest.generated.yaml.
+#   __FUNCTION_HOST__  e.g. arbox.azurewebsites.net
+#   __FUNCTION_KEY__   the function app's default host key
+display_information:
+  name: Arbox
+  description: Registers you to CrossFit classes on Arbox
+features:
+  bot_user:
+    display_name: arbox
+    always_online: false
+  slash_commands:
+    - command: /arbox
+      url: https://__FUNCTION_HOST__/api/slack/commands?code=__FUNCTION_KEY__
+      description: List and book classes for a day
+      usage_hint: "[sun|mon|tue|wed|thu|fri|sat]"
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - commands
+settings:
+  interactivity:
+    is_enabled: true
+    request_url: https://__FUNCTION_HOST__/api/slack/actions?code=__FUNCTION_KEY__
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

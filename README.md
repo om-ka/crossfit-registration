@@ -19,6 +19,22 @@ Timer-triggered Azure Function that logs into Arbox and enrolls you into the nex
     - Register: `POST /api/v2/scheduleUser/insert`
   - Status 516 is treated as “class is full.”
 
+## Deploy for a friend (new Azure + Slack setup)
+Needs an Azure subscription, the Azure CLI and Azure Functions Core Tools (the script installs them via Homebrew on macOS).
+
+1. Run `./deploy.sh` (macOS/Linux) or `.\deploy.ps1` (Windows). It creates the Azure resources, asks for the Arbox email/password and deploys the code.
+2. The script then runs the Slack setup and prints a Slack app manifest with this Function App's URLs filled in (also saved to `slack-manifest.generated.yaml`, which is git-ignored because it contains the function key).
+3. In Slack: https://api.slack.com/apps → **Create New App → From an app manifest** → paste it → **Install to Workspace**. Then run `/invite @arbox` in the channel to use.
+4. Paste back the bot token, signing secret and channel ID when the script asks. It saves them to the Function App and posts a test message.
+
+To (re)do only the Slack part for an existing Function App:
+```bash
+./slack-setup.sh --function-name <app> --resource-group <rg>
+```
+```powershell
+.\slack-setup.ps1 -FunctionAppName <app> -ResourceGroupName <rg>
+```
+
 ## Setup
 1) Install Python deps:
 ```bash
