@@ -3,11 +3,10 @@
 Arbox one-shot enrolment.
 
 Timer-friendly script that logs in, waits until a target time, registers for
-the configured classes and posts a single Slack summary. Classes that could
+the configured classes and posts a single summary to Slack and/or Telegram. Classes that could
 not be booked are offered as buttons with the other times available that day.
 """
 
-import json
 import os
 import sys
 import time
@@ -18,7 +17,7 @@ import requests
 
 try:
     from data.config import config
-    from lib.slack import post_message
+    from lib.messaging import send_message
 except Exception as exc:  # noqa: BLE001
     print(f"Failed to load config/environment: {exc}")
     raise
@@ -224,8 +223,8 @@ def validate_inputs(date_str: str, start_time: str) -> None:
 
 
 def notify(title: str, message: str) -> None:
-    """Send a plain Slack message (used for errors only; the run summary has its own message)."""
-    post_message(f"*{title}*\n{message}")
+    """Send a plain message (used for errors only; the run summary has its own message)."""
+    send_message(text_message(f"*{title}*\n{message}"))
 
 
 def get_timezone():
@@ -384,47 +383,53 @@ def class_label(entry: Dict[str, Any]) -> str:
     return f"{entry.get('time')} {name}" if name else str(entry.get("time"))
 
 
-def register_button(entry: Dict[str, Any], requested_time: str) -> Dict[str, Any]:
-    value = {"d": entry.get("date"), "t": entry.get("time"), "s": entry["id"], "r": requested_time}
+# Messages are built in a neutral format and rendered by lib/slack.py and
+# lib/telegram.py: {"text": fallback, "parts": [{"text", "key", "buttons"}]}.
+# Part text uses *bold* and `code`.
+MAX_BUTTONS = 24  # Slack allows 25 elements per actions block; one is kept for Skip.
+
+
+def part(text: str, key: Optional[str] = None, buttons: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    return {"text": text, "key": key, "buttons": buttons or []}
+
+
+def text_message(text: str) -> Dict[str, Any]:
+    return {"text": text, "parts": [part(text)]}
+
+
+def register_option(entry: Dict[str, Any], requested_time: str, label: Optional[str] = None) -> Dict[str, Any]:
     return {
-        "type": "button",
-        "text": {"type": "plain_text", "text": class_label(entry)[:75]},
-        "action_id": f"{ACTION_REGISTER}:{entry['id']}",
-        "value": json.dumps(value),
+        "action": ACTION_REGISTER,
+        "label": label or class_label(entry),
+        "date": entry.get("date"),
+        "time": entry.get("time"),
+        "schedule_id": entry["id"],
+        "requested_time": requested_time,
     }
 
 
-def failure_blocks(date_str: str, start_time: str, error: Exception, token: str, refresh_token: str) -> List[Dict[str, Any]]:
-    """Blocks for a class that couldn't be booked: what went wrong plus buttons for alternatives."""
+def skip_option(date_str: str, requested_time: str) -> Dict[str, Any]:
+    return {"action": ACTION_SKIP, "label": "Skip", "date": date_str, "time": requested_time}
+
+
+def failure_parts(date_str: str, start_time: str, error: Exception, token: str, refresh_token: str) -> List[Dict[str, Any]]:
+    """Parts for a class that couldn't be booked: what went wrong plus buttons for alternatives."""
     day = format_day(date_str)
     try:
         schedule = fetch_day_schedule(date_str, token, refresh_token)
     except Exception as exc:  # noqa: BLE001
-        return [section(f"❌ *{day} {start_time}* — {error}\nCouldn't load that day's schedule: {exc}")]
+        return [part(f"❌ *{day} {start_time}* — {error}\nCouldn't load that day's schedule: {exc}")]
 
     if not schedule:
-        return [section(f"🚫 *{day} {start_time}* — no classes listed that day (holiday / closed?)")]
+        return [part(f"🚫 *{day} {start_time}* — no classes listed that day (holiday / closed?)")]
 
     alternatives = bookable_alternatives(schedule)
     if not alternatives:
-        return [section(f"⚠️ *{day} {start_time}* — {error}\nNo other classes with free spots that day.")]
+        return [part(f"⚠️ *{day} {start_time}* — {error}\nNo other classes with free spots that day.")]
 
-    # Slack allows up to 25 elements per actions block; one is reserved for Skip.
-    buttons = [register_button(e, start_time) for e in alternatives[:24]]
-    buttons.append({
-        "type": "button",
-        "text": {"type": "plain_text", "text": "Skip"},
-        "action_id": ACTION_SKIP,
-        "value": json.dumps({"d": date_str, "r": start_time}),
-    })
-    return [
-        section(f"⚠️ *{day} {start_time}* — {error}\nPick another class that day:"),
-        {"type": "actions", "block_id": f"day:{date_str}", "elements": buttons},
-    ]
-
-
-def section(text: str) -> Dict[str, Any]:
-    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+    buttons = [register_option(e, start_time) for e in alternatives[:MAX_BUTTONS]]
+    buttons.append(skip_option(date_str, start_time))
+    return [part(f"⚠️ *{day} {start_time}* — {error}\nPick another class that day:", key=f"day:{date_str}", buttons=buttons)]
 
 
 def success_line(summary: Dict[str, Any]) -> str:
@@ -433,27 +438,27 @@ def success_line(summary: Dict[str, Any]) -> str:
 
 
 def post_summary(outcome: Dict[str, Any], token: str, refresh_token: str) -> None:
-    """Post one Slack message summarizing the run."""
+    """Send one message summarizing the run."""
     summaries = sorted(outcome["summaries"], key=lambda s: s["date"])
     failures = sorted(outcome["failures"].items())
 
-    blocks: List[Dict[str, Any]] = []
+    parts: List[Dict[str, Any]] = []
     if summaries:
-        blocks.append(section("\n".join(success_line(s) for s in summaries)))
+        parts.append(part("\n".join(success_line(s) for s in summaries)))
     for (date_str, start_time), exc in failures:
-        blocks.extend(failure_blocks(date_str, start_time, exc, token, refresh_token))
-    if not blocks:
-        blocks.append(section("Nothing to book this week."))
+        parts.extend(failure_parts(date_str, start_time, exc, token, refresh_token))
+    if not parts:
+        parts.append(part("Nothing to book this week."))
 
     if failures:
         text = f"Arbox: {len(summaries)} registered, {len(failures)} need attention"
     else:
         text = f"Arbox: all {len(summaries)} classes registered"
-    post_message(text, blocks)
+    send_message({"text": text, "parts": parts})
 
 
 def run_coordinated_flow() -> Dict[str, Any]:
-    """Wait until run time, enroll all configured classes and post a Slack summary."""
+    """Wait until run time, enroll all configured classes and post a summary."""
     # SKIP_TIME_CHECK=true (testing) runs immediately instead of waiting for RUN_TIME.
     if os.getenv("SKIP_TIME_CHECK", "false").lower() != "true":
         wait_until_run_time(RUN_TIME)
@@ -504,53 +509,48 @@ def next_date_including_today(target_weekday: int, from_date: datetime) -> str:
     return (from_date + timedelta(days=delta_days)).strftime("%Y-%m-%d")
 
 
-def day_blocks(date_str: str, schedule: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def day_parts(date_str: str, schedule: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """All classes of a day: booked, bookable (as buttons) and full."""
     day = format_day(date_str)
     entries = [e for e in schedule if e.get("status") == "active" and not e.get("past")]
     if not entries:
-        return [section(f"🚫 *{day}* — no upcoming classes listed (holiday / closed?)")]
+        return [part(f"🚫 *{day}* — no upcoming classes listed (holiday / closed?)")]
 
     lines = [f"📅 *{day}*"]
     lines += [f"✅ {class_label(e)} — you're booked" for e in entries if e.get("user_booked")]
     full = [e for e in entries if not e.get("user_booked") and (e.get("free") or 0) <= 0]
     if full:
         lines.append("⛔ Full: " + ", ".join(class_label(e) for e in full))
-    blocks = [section("\n".join(lines))]
 
-    free = [e for e in bookable_alternatives(schedule)]
-    if free:
-        buttons = []
-        for e in free[:25]:
-            button = register_button(e, e.get("time"))
-            button["text"]["text"] = f"{class_label(e)} ({e.get('free')} free)"[:75]
-            buttons.append(button)
-        blocks.append({"type": "actions", "block_id": f"day:{date_str}", "elements": buttons})
-    return blocks
+    buttons = [
+        register_option(e, e.get("time"), f"{class_label(e)} ({e.get('free')} free)")
+        for e in bookable_alternatives(schedule)[:MAX_BUTTONS]
+    ]
+    return [part("\n".join(lines), key=f"day:{date_str}", buttons=buttons)]
 
 
 def day_command(text: str) -> Dict[str, Any]:
-    """Handle '/arbox <day>': return a Slack message with that day's classes."""
+    """Handle '/arbox <day>': return a message with that day's classes."""
     arg = (text or "").strip().lower()
     try:
         idx = weekday_index(arg)
     except KeyError:
-        return {"text": "Usage: `/arbox <day>`, e.g. `/arbox wed`"}
+        return text_message("Usage: `/arbox <day>`, e.g. `/arbox wed`")
 
     now = now_with_tz()
     date_str = next_date_including_today(idx, now)
     if datetime.strptime(date_str, "%Y-%m-%d").date() > open_week_end(now).date():
         days_to_thu = (WEEK_OPENS_WEEKDAY - now.weekday()) % 7
         opens = (now + timedelta(days=days_to_thu)).strftime("%a %d/%m")
-        return {"text": f"Registration for {format_day(date_str)} isn't open yet — it opens {opens} at {WEEK_OPENS_TIME}."}
+        return text_message(f"Registration for {format_day(date_str)} isn't open yet — it opens {opens} at {WEEK_OPENS_TIME}.")
 
     auth = login_from_config()
     schedule = fetch_day_schedule(date_str, auth["token"], auth["refresh_token"])
-    return {"text": f"Arbox classes {format_day(date_str)}", "blocks": day_blocks(date_str, schedule)}
+    return {"text": f"Arbox classes {format_day(date_str)}", "parts": day_parts(date_str, schedule)}
 
 
 def register_from_button(value: Dict[str, Any]) -> str:
-    """Handle a Slack 'register' button: book the chosen class and return a status line."""
+    """Handle a 'register' button (Slack or Telegram): book the chosen class and return a status line."""
     date_str, start_time, schedule_id = value["d"], value["t"], value["s"]
     day = format_day(date_str)
     tz = get_timezone()

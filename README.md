@@ -23,17 +23,23 @@ Timer-triggered Azure Function that logs into Arbox and enrolls you into the nex
 Needs an Azure subscription, the Azure CLI and Azure Functions Core Tools (the script installs them via Homebrew on macOS).
 
 1. Run `./deploy.sh` (macOS/Linux) or `.\deploy.ps1` (Windows). It creates the Azure resources, asks for the Arbox email/password and deploys the code.
-2. The script then runs the Slack setup and prints a Slack app manifest with this Function App's URLs filled in (also saved to `slack-manifest.generated.yaml`, which is git-ignored because it contains the function key).
+2. The script asks whether to set up **Telegram** and/or **Slack** (both can be active; registration works with neither).
+   - Telegram (simplest): create a bot with @BotFather (`/newbot`), paste its token, then press Start in the bot chat. The script finds your chat id, registers the webhook and saves the settings.
+   - Slack: the script prints a Slack app manifest with this Function App's URLs filled in (also saved to `slack-manifest.generated.yaml`, which is git-ignored because it contains the function key).
 3. In Slack: https://api.slack.com/apps → **Create New App → From an app manifest** → paste it → **Install to Workspace**. Then run `/invite @arbox` in the channel to use.
 4. Paste back the bot token, signing secret and channel ID when the script asks. It saves them to the Function App and posts a test message.
 
-To (re)do only the Slack part for an existing Function App:
+To (re)do only the messaging part for an existing Function App:
 ```bash
+./telegram-setup.sh --function-name <app> --resource-group <rg>
 ./slack-setup.sh --function-name <app> --resource-group <rg>
 ```
 ```powershell
+.\telegram-setup.ps1 -FunctionAppName <app> -ResourceGroupName <rg>
 .\slack-setup.ps1 -FunctionAppName <app> -ResourceGroupName <rg>
 ```
+
+Telegram commands: `/arbox wed` or just `/wed`; `/start` shows your chat id.
 
 ## Setup
 1) Install Python deps:
@@ -47,6 +53,7 @@ pip install -r requirements.txt
 - `SLACK_BOT_TOKEN` (bot scope `chat:write`, bot invited to the channel)
 - `SLACK_SIGNING_SECRET`
 - `SLACK_CHANNEL_ID`
+- Telegram (optional, set by `telegram-setup.sh`): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_WEBHOOK_SECRET`
 - Optional: `SLACK_ALLOWED_USER_IDS` (comma-separated Slack user ids allowed to press buttons)
 - Optional: `TZ` (e.g., `Asia/Jerusalem`) or set `timezone` in `data/config.py`.
 - Optional overrides:
@@ -71,7 +78,8 @@ This follows the same wait/notify/enroll flow using the default constants.
 - `function_app.py` — Python v2 programming model entrypoint; timer schedule lives here.
 - `arboxrun.py` — main logic, wait-and-notify loop, multi-class enrollment flow.
 - `data/config.py` — loads env vars; timezone fallback (`TZ`).
-- `lib/slack.py` — Slack posting and request signature verification.
+- `lib/messaging.py` — sends each message to every configured channel.
+- `lib/slack.py` / `lib/telegram.py` — rendering, sending and request verification per channel.
 
 ## Notes
 - Python Azure Functions run on Linux; timezone is handled by the dual UTC triggers plus the TZ guard. Keep `TZ` (e.g., `Asia/Jerusalem`) set in App Settings.

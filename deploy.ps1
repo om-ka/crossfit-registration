@@ -317,8 +317,17 @@ try {
 Write-Success "Function code deployed"
 #endregion
 
-#region Slack
-& (Join-Path $scriptDir "slack-setup.ps1") -FunctionAppName $FunctionAppName -ResourceGroupName $ResourceGroupName
+#region Messaging
+Write-Step "Messaging (summaries, buttons and day commands)..."
+Write-Host "  Set up Slack, Telegram, both or neither (registration works without them)."
+$setupTelegram = Read-Host "  Set up Telegram? (y/N)"
+if ($setupTelegram -eq "y" -or $setupTelegram -eq "Y") {
+    & (Join-Path $scriptDir "telegram-setup.ps1") -FunctionAppName $FunctionAppName -ResourceGroupName $ResourceGroupName
+}
+$setupSlack = Read-Host "  Set up Slack? (y/N)"
+if ($setupSlack -eq "y" -or $setupSlack -eq "Y") {
+    & (Join-Path $scriptDir "slack-setup.ps1") -FunctionAppName $FunctionAppName -ResourceGroupName $ResourceGroupName
+}
 #endregion
 
 #region Summary
@@ -346,6 +355,7 @@ Write-Host "    Runs every Thursday at 11:58 and 12:58 UTC"
 Write-Host "    Waits until 15:00 Israel time to register"
 
 Write-Host "`n  Useful commands:" -ForegroundColor Cyan
+Write-Host "    Telegram:     .\telegram-setup.ps1 -FunctionAppName $FunctionAppName -ResourceGroupName $ResourceGroupName"
 Write-Host "    Redo Slack:   .\slack-setup.ps1 -FunctionAppName $FunctionAppName -ResourceGroupName $ResourceGroupName"
 Write-Host "    View logs:    az functionapp log tail --name $FunctionAppName --resource-group $ResourceGroupName"
 Write-Host "    View metrics: https://portal.azure.com/#@/resource/subscriptions/$($account.id)/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/sites/$FunctionAppName/appInsightsQueryLogs"

@@ -17,9 +17,10 @@ from arboxrun import (
     parse_hhmm,
     register_from_button,
     run_coordinated_flow,
-    section,
+    text_message,
 )
-from lib.slack import respond, verify_signature
+from lib import slack, telegram
+from lib.slack import respond, section, verify_signature
 
 app = func.FunctionApp()
 
@@ -29,7 +30,8 @@ RUN_WINDOW_MINUTES = 5
 # Set SKIP_TIME_CHECK=true to bypass the time window check (for testing)
 SKIP_TIME_CHECK = os.getenv("SKIP_TIME_CHECK", "false").lower() == "true"
 
-# Button clicks are queued so the HTTP handler can ack Slack within its 3s limit.
+# Button clicks and commands (Slack and Telegram) are queued so the HTTP handlers
+# can answer within Slack's 3s limit; the worker does the slow Arbox calls.
 SLACK_ACTIONS_QUEUE = "slack-actions"
 
 # Optional comma-separated Slack user ids allowed to press buttons (empty = anyone in the channel).
@@ -120,22 +122,93 @@ def slack_commands(req: func.HttpRequest, queue: func.Out[str]) -> func.HttpResp
     return func.HttpResponse(status_code=200)
 
 
-@app.function_name(name="SlackActionWorker")
-@app.queue_trigger(arg_name="item", queue_name=SLACK_ACTIONS_QUEUE, connection="AzureWebJobsStorage")
-def slack_action_worker(item: func.QueueMessage) -> None:
-    job = json.loads(item.get_body().decode())
-    if job.get("kind") == "command":
+TELEGRAM_HELP = (
+    "Send `/arbox <day>` (or just `/wed`) to see that day's classes and book one.\n"
+    "Your chat id is `{chat_id}`."
+)
+
+
+def telegram_command_arg(text: str) -> str:
+    """'/arbox wed', '/arbox@my_bot wed' and '/wed' all return 'wed'."""
+    words = text.strip().split()
+    command = words[0][1:].split("@")[0].lower()
+    return " ".join(words[1:]) if command == "arbox" else command
+
+
+@app.function_name(name="TelegramWebhook")
+@app.route(route="telegram/webhook", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+@app.queue_output(arg_name="queue", queue_name=SLACK_ACTIONS_QUEUE, connection="AzureWebJobsStorage")
+def telegram_webhook(req: func.HttpRequest, queue: func.Out[str]) -> func.HttpResponse:
+    if not telegram.verify_secret(req.headers.get("X-Telegram-Bot-Api-Secret-Token", "")):
+        return func.HttpResponse("invalid secret", status_code=401)
+
+    update = req.get_json()
+    allowed_chat = os.getenv("TELEGRAM_CHAT_ID", "")
+    callback = update.get("callback_query")
+    message = update.get("message")
+
+    if callback:
+        msg = callback.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        if str(chat_id) != allowed_chat:
+            telegram.answer_callback(callback["id"])
+            return func.HttpResponse(status_code=200)
+        value = telegram.parse_button_data(callback.get("data", ""))
+        # Remove that day's buttons right away so they can't be pressed twice.
+        telegram.remove_day_buttons(chat_id, msg["message_id"], msg.get("reply_markup"), value["d"])
+        if value["action"] == ACTION_SKIP:
+            telegram.answer_callback(callback["id"], "Skipped")
+            telegram.send(text_message(f"⏭️ *{format_day(value['d'])} {value['r']}* — skipped"), chat_id, msg["message_id"])
+        else:
+            telegram.answer_callback(callback["id"], f"Registering {value['t']} ...")
+            queue.set(json.dumps({"kind": "telegram_register", "value": value, "chat_id": chat_id, "message_id": msg["message_id"]}))
+    elif message and (message.get("text") or "").startswith("/"):
+        chat_id = message["chat"]["id"]
+        arg = telegram_command_arg(message["text"])
+        if arg in ("start", "help") or str(chat_id) != allowed_chat:
+            # Reply with the chat id even to unknown chats: it's needed for setup and reveals nothing else.
+            telegram.send(text_message(TELEGRAM_HELP.format(chat_id=chat_id)), chat_id)
+        else:
+            queue.set(json.dumps({"kind": "telegram_command", "text": arg, "chat_id": chat_id}))
+
+    return func.HttpResponse(status_code=200)
+
+
+def run_job(job: dict) -> None:
+    kind = job.get("kind")
+    if kind == "command":
         try:
             message = day_command(job["text"])
         except Exception as exc:  # noqa: BLE001
             logging.exception("Slack command failed")
-            message = {"text": f"❌ {exc}"}
-        respond(job["response_url"], {"response_type": "in_channel", **message})
+            message = text_message(f"❌ {exc}")
+        respond(job["response_url"], {"response_type": "in_channel", **slack.render(message)})
         return
 
+    if kind == "telegram_command":
+        try:
+            message = day_command(job["text"])
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Telegram command failed")
+            message = text_message(f"❌ {exc}")
+        telegram.send(message, job["chat_id"])
+        return
+
+    value = job["value"]
     try:
-        text = register_from_button(job["value"])
+        text = register_from_button(value)
     except Exception as exc:  # noqa: BLE001
-        logging.exception("Registration from Slack failed")
-        text = f"❌ *{format_day(job['value']['d'])} {job['value']['t']}* — {exc}"
-    respond(job["response_url"], {"replace_original": True, "blocks": replace_block(job["blocks"], job["block_id"], text)})
+        logging.exception("Registration from button failed")
+        text = f"❌ *{format_day(value['d'])} {value['t']}* — {exc}"
+
+    if kind == "telegram_register":
+        telegram.send(text_message(text), job["chat_id"], job["message_id"])
+    else:
+        respond(job["response_url"], {"replace_original": True, "blocks": replace_block(job["blocks"], job["block_id"], text)})
+
+
+@app.function_name(name="SlackActionWorker")
+@app.queue_trigger(arg_name="item", queue_name=SLACK_ACTIONS_QUEUE, connection="AzureWebJobsStorage")
+def slack_action_worker(item: func.QueueMessage) -> None:
+    # Handles queued Slack and Telegram jobs (name kept so the deployed function isn't recreated).
+    run_job(json.loads(item.get_body().decode()))

@@ -11,6 +11,9 @@
     "SLACK_BOT_TOKEN": "",
     "SLACK_SIGNING_SECRET": "",
     "SLACK_CHANNEL_ID": "",
+    "TELEGRAM_BOT_TOKEN": "",
+    "TELEGRAM_CHAT_ID": "",
+    "TELEGRAM_WEBHOOK_SECRET": "",
     "TZ": "Asia/Jerusalem"
   }
 }

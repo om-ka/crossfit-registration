@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -9,6 +10,53 @@ import requests
 POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 # Slack rejects requests older than this to prevent replays.
 SIGNATURE_MAX_AGE_SEC = 60 * 5
+
+
+def is_configured() -> bool:
+    return bool(os.environ.get("SLACK_BOT_TOKEN") and os.environ.get("SLACK_CHANNEL_ID"))
+
+
+def section(text: str) -> Dict[str, Any]:
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+
+
+def button_element(button: Dict[str, Any]) -> Dict[str, Any]:
+    if button["action"] == "register":
+        action_id = f"register:{button['schedule_id']}"
+        value = {"d": button["date"], "t": button["time"], "s": button["schedule_id"], "r": button["requested_time"]}
+    else:
+        action_id = button["action"]
+        value = {"d": button["date"], "r": button["time"]}
+    return {
+        "type": "button",
+        "text": {"type": "plain_text", "text": button["label"][:75]},
+        "action_id": action_id,
+        "value": json.dumps(value),
+    }
+
+
+def render_blocks(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Render a neutral message ({"text", "parts": [{"text", "key", "buttons"}]}) as Slack blocks."""
+    blocks: List[Dict[str, Any]] = []
+    for part in message.get("parts", []):
+        blocks.append(section(part["text"]))
+        if part.get("buttons"):
+            blocks.append({
+                "type": "actions",
+                "block_id": part["key"],
+                "elements": [button_element(b) for b in part["buttons"]],
+            })
+    return blocks
+
+
+def render(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Slack message payload (text + blocks) for chat.postMessage or a response_url."""
+    return {"text": message["text"], "blocks": render_blocks(message)}
+
+
+def send(message: Dict[str, Any]) -> None:
+    rendered = render(message)
+    post_message(rendered["text"], rendered["blocks"])
 
 
 def post_message(text: str, blocks: Optional[List[Dict[str, Any]]] = None) -> None:

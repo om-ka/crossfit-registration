@@ -317,8 +317,17 @@ popd > /dev/null
 success "Function code deployed"
 #endregion
 
-#region Slack
-"$SCRIPT_DIR/slack-setup.sh" --function-name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP_NAME"
+#region Messaging
+step "Messaging (summaries, buttons and day commands)..."
+echo "  Set up Slack, Telegram, both or neither (registration works without them)."
+read -p "  Set up Telegram? (y/N): " SETUP_TELEGRAM
+if [[ "$SETUP_TELEGRAM" =~ ^[Yy]$ ]]; then
+    "$SCRIPT_DIR/telegram-setup.sh" --function-name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP_NAME"
+fi
+read -p "  Set up Slack? (y/N): " SETUP_SLACK
+if [[ "$SETUP_SLACK" =~ ^[Yy]$ ]]; then
+    "$SCRIPT_DIR/slack-setup.sh" --function-name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP_NAME"
+fi
 #endregion
 
 #region Summary
@@ -344,6 +353,7 @@ echo "    Runs every Thursday at 11:58 and 12:58 UTC"
 echo "    Waits until 15:00 Israel time to register"
 
 echo -e "\n${CYAN}  Useful commands:${NC}"
+echo "    Telegram:     ./telegram-setup.sh --function-name $FUNCTION_APP_NAME --resource-group $RESOURCE_GROUP_NAME"
 echo "    Redo Slack:   ./slack-setup.sh --function-name $FUNCTION_APP_NAME --resource-group $RESOURCE_GROUP_NAME"
 echo "    View logs:    az functionapp log tail --name $FUNCTION_APP_NAME --resource-group $RESOURCE_GROUP_NAME"
 
