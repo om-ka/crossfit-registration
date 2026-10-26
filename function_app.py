@@ -7,15 +7,17 @@ from urllib.parse import parse_qs
 import azure.functions as func
 
 from arboxrun import (
+    ACTION_CANCEL,
     ACTION_REGISTER,
     ACTION_SKIP,
+    ACTION_SWITCH,
     RUN_TIME,
     day_command,
     format_day,
     now_with_tz,
     notify,
     parse_hhmm,
-    register_from_button,
+    handle_button,
     run_coordinated_flow,
     text_message,
 )
@@ -70,6 +72,15 @@ def replace_block(blocks: list, block_id: str, text: str) -> list:
     return [section(text) if b.get("block_id") == block_id else b for b in blocks]
 
 
+def pending_text(value: dict) -> str:
+    day = format_day(value["d"])
+    if value["action"] == ACTION_CANCEL:
+        return f"⏳ Cancelling *{day}* ..."
+    if value["action"] == ACTION_SWITCH:
+        return f"⏳ Switching *{day}* to {value['t']} ..."
+    return f"⏳ Registering *{day} {value['t']}* ..."
+
+
 @app.function_name(name="SlackActions")
 @app.route(route="slack/actions", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 @app.queue_output(arg_name="queue", queue_name=SLACK_ACTIONS_QUEUE, connection="AzureWebJobsStorage")
@@ -94,9 +105,10 @@ def slack_actions(req: func.HttpRequest, queue: func.Out[str]) -> func.HttpRespo
     if action_id == ACTION_SKIP:
         text = f"⏭️ *{format_day(value['d'])} {value['r']}* — skipped"
         respond(response_url, {"replace_original": True, "blocks": replace_block(blocks, block_id, text)})
-    elif action_id.startswith(ACTION_REGISTER):
+    elif action_id.split(":")[0] in (ACTION_REGISTER, ACTION_SWITCH, ACTION_CANCEL):
+        value["action"] = action_id.split(":")[0]
         # Swap the buttons for a pending line right away so they can't be pressed twice.
-        pending = replace_block(blocks, block_id, f"⏳ Registering *{format_day(value['d'])} {value['t']}* ...")
+        pending = replace_block(blocks, block_id, pending_text(value))
         respond(response_url, {"replace_original": True, "blocks": pending})
         queue.set(json.dumps({"value": value, "response_url": response_url, "blocks": blocks, "block_id": block_id}))
 
@@ -160,7 +172,7 @@ def telegram_webhook(req: func.HttpRequest, queue: func.Out[str]) -> func.HttpRe
             telegram.answer_callback(callback["id"], "Skipped")
             telegram.send(text_message(f"⏭️ *{format_day(value['d'])} {value['r']}* — skipped"), chat_id, msg["message_id"])
         else:
-            telegram.answer_callback(callback["id"], f"Registering {value['t']} ...")
+            telegram.answer_callback(callback["id"], pending_text(value).replace("*", ""))
             queue.set(json.dumps({"kind": "telegram_register", "value": value, "chat_id": chat_id, "message_id": msg["message_id"]}))
     elif message and (message.get("text") or "").startswith("/"):
         chat_id = message["chat"]["id"]
@@ -196,10 +208,10 @@ def run_job(job: dict) -> None:
 
     value = job["value"]
     try:
-        text = register_from_button(value)
+        text = handle_button(value)
     except Exception as exc:  # noqa: BLE001
-        logging.exception("Registration from button failed")
-        text = f"❌ *{format_day(value['d'])} {value['t']}* — {exc}"
+        logging.exception("Button action failed")
+        text = f"❌ *{format_day(value['d'])}* — {exc}"
 
     if kind == "telegram_register":
         telegram.send(text_message(text), job["chat_id"], job["message_id"])

@@ -24,6 +24,12 @@ def button_element(button: Dict[str, Any]) -> Dict[str, Any]:
     if button["action"] == "register":
         action_id = f"register:{button['schedule_id']}"
         value = {"d": button["date"], "t": button["time"], "s": button["schedule_id"], "r": button["requested_time"]}
+    elif button["action"] == "switch":
+        action_id = f"switch:{button['schedule_id']}"
+        value = {"d": button["date"], "t": button["time"], "s": button["schedule_id"], "o": button["old_schedule_id"]}
+    elif button["action"] == "cancel":
+        action_id = "cancel"
+        value = {"d": button["date"], "o": button["old_schedule_id"]}
     else:
         action_id = button["action"]
         value = {"d": button["date"], "r": button["time"]}

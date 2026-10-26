@@ -32,6 +32,7 @@ API_BASE = "https://apiappv2.arboxapp.com/api/v2"
 LOGIN_URL = f"{API_BASE}/user/login"
 SCHEDULE_URL = f"{API_BASE}/schedule/betweenDates?XDEBUG_SESSION_START=PHPSTORM"
 REGISTER_URL = f"{API_BASE}/scheduleUser/insert?XDEBUG_SESSION_START=PHPSTORM"
+CANCEL_URL = f"{API_BASE}/scheduleUser/delete?XDEBUG_SESSION_START=PHPSTORM"
 MEMBERSHIP_URL_TEMPLATE = f"{API_BASE}/boxes/{{box_id}}/memberships/{{membership_type}}"
 
 DEFAULT_BOX_ID = 28
@@ -57,9 +58,16 @@ CLASS_POLL_INTERVAL_SEC = 2
 
 REGISTER_RETRY_DELAYS_SEC = [0.01, 0.1, 1.0, 2.0, 3.0]
 
+# When the requested class doesn't exist (holiday / changed schedule), book the
+# first later class within this many hours instead, skipping these class types.
+FALLBACK_WINDOW_HOURS = 2
+EXCLUDED_CLASS_KEYWORDS = ("kids", "junior", "open gym")
+
 # Slack button action ids
 ACTION_REGISTER = "register"
 ACTION_SKIP = "skip"
+ACTION_SWITCH = "switch"
+ACTION_CANCEL = "cancel"
 
 
 class ClassFullError(RuntimeError):
@@ -216,6 +224,17 @@ def register_for_class(
     raise last_error  # type: ignore[misc]
 
 
+def cancel_booking(schedule_user_id: int, schedule_id: int, token: str, refresh_token: str) -> None:
+    payload = {"schedule_user_id": schedule_user_id, "schedule_id": schedule_id}
+    resp = requests.post(CANCEL_URL, headers=auth_headers(token, refresh_token), json=payload)
+    if resp.status_code != 200:
+        try:
+            error_message = resp.json().get("error", {}).get("messageToUser") or resp.text
+        except Exception:  # noqa: BLE001
+            error_message = resp.text
+        raise RuntimeError(f"Cancellation failed ({resp.status_code}): {error_message}")
+
+
 def validate_inputs(date_str: str, start_time: str) -> None:
     """Quick validation so the API gets clean values."""
     datetime.strptime(date_str, "%Y-%m-%d")
@@ -366,11 +385,51 @@ def enroll_all(targets: List[tuple], token: str, refresh_token: str) -> Dict[str
     return {"summaries": summaries, "failures": failures}
 
 
+def is_excluded_class(entry: Dict[str, Any]) -> bool:
+    name = ((entry.get("box_categories") or {}).get("name") or "").lower()
+    return any(keyword in name for keyword in EXCLUDED_CLASS_KEYWORDS)
+
+
+def pick_fallback(schedule: List[Dict[str, Any]], requested_time: str) -> Optional[Dict[str, Any]]:
+    """First bookable class after requested_time, within FALLBACK_WINDOW_HOURS, that isn't excluded."""
+    requested = parse_hhmm(requested_time)
+    start = requested.hour * 60 + requested.minute
+    candidates = []
+    for entry in bookable_alternatives(schedule):
+        class_time = parse_hhmm(entry["time"])
+        minutes = class_time.hour * 60 + class_time.minute
+        if start < minutes <= start + FALLBACK_WINDOW_HOURS * 60:
+            candidates.append((minutes, entry))
+    return min(candidates, key=lambda c: c[0])[1] if candidates else None
+
+
+def apply_fallbacks(outcome: Dict[str, Any], token: str, refresh_token: str) -> None:
+    """For classes that don't exist, book the next suitable class that day (moved to outcome["switched"])."""
+    outcome["switched"] = []
+    for (date_str, start_time), exc in list(outcome["failures"].items()):
+        if isinstance(exc, ClassFullError):
+            continue  # The class exists; ask instead of guessing.
+        try:
+            schedule = fetch_day_schedule(date_str, token, refresh_token)
+            fallback = pick_fallback(schedule, start_time)
+            if fallback is None:
+                continue
+            enroll_schedule_entry(fallback, token, refresh_token)
+        except Exception as fallback_exc:  # noqa: BLE001
+            print(f"Fallback for {date_str} {start_time} failed: {fallback_exc}")
+            continue
+        del outcome["failures"][(date_str, start_time)]
+        outcome["switched"].append(
+            {"date": date_str, "requested_time": start_time, "booked": fallback, "schedule": schedule}
+        )
+
+
 def bookable_alternatives(schedule: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Classes on the day that are active, upcoming, have free spots and aren't booked yet."""
+    """Classes on the day that are active, upcoming, have free spots, aren't booked yet and aren't excluded."""
     return [
         e for e in schedule
-        if e.get("status") == "active" and not e.get("past") and (e.get("free") or 0) > 0 and not e.get("user_booked")
+        if e.get("status") == "active" and not e.get("past") and (e.get("free") or 0) > 0
+        and not e.get("user_booked") and not is_excluded_class(e)
     ]
 
 
@@ -408,6 +467,38 @@ def register_option(entry: Dict[str, Any], requested_time: str, label: Optional[
     }
 
 
+def switch_option(entry: Dict[str, Any], old_entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "action": ACTION_SWITCH,
+        "label": class_label(entry),
+        "date": entry.get("date"),
+        "time": entry.get("time"),
+        "schedule_id": entry["id"],
+        "old_schedule_id": old_entry["id"],
+    }
+
+
+def cancel_option(date_str: str, old_entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "action": ACTION_CANCEL,
+        "label": f"❌ Cancel {datetime.strptime(date_str, '%Y-%m-%d').strftime('%a')}",
+        "date": date_str,
+        "old_schedule_id": old_entry["id"],
+    }
+
+
+def switched_parts(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """A class booked automatically at another time, with buttons to switch or cancel."""
+    date_str, booked = item["date"], item["booked"]
+    others = [e for e in bookable_alternatives(item["schedule"]) if e["id"] != booked["id"]][:MAX_BUTTONS]
+    buttons = [switch_option(e, booked) for e in others] + [cancel_option(date_str, booked)]
+    text = (
+        f"🔄 *{format_day(date_str)} {item['requested_time']}* not available — "
+        f"booked *{class_label(booked)}* instead.\nKeep it, switch or cancel:"
+    )
+    return [part(text, key=f"day:{date_str}", buttons=buttons)]
+
+
 def skip_option(date_str: str, requested_time: str) -> Dict[str, Any]:
     return {"action": ACTION_SKIP, "label": "Skip", "date": date_str, "time": requested_time}
 
@@ -443,15 +534,20 @@ def post_summary(outcome: Dict[str, Any], token: str, refresh_token: str) -> Non
     failures = sorted(outcome["failures"].items())
 
     parts: List[Dict[str, Any]] = []
+    switched = sorted(outcome.get("switched", []), key=lambda i: i["date"])
     if summaries:
         parts.append(part("\n".join(success_line(s) for s in summaries)))
+    for item in switched:
+        parts.extend(switched_parts(item))
     for (date_str, start_time), exc in failures:
         parts.extend(failure_parts(date_str, start_time, exc, token, refresh_token))
     if not parts:
         parts.append(part("Nothing to book this week."))
 
     if failures:
-        text = f"Arbox: {len(summaries)} registered, {len(failures)} need attention"
+        text = f"Arbox: {len(summaries) + len(switched)} registered, {len(failures)} need attention"
+    elif switched:
+        text = f"Arbox: all registered, {len(switched)} at a different time"
     else:
         text = f"Arbox: all {len(summaries)} classes registered"
     send_message({"text": text, "parts": parts})
@@ -484,8 +580,9 @@ def run_coordinated_flow() -> Dict[str, Any]:
         targets.append((target_date, start_time))
 
     outcome = enroll_all(targets, token, refresh_token)
+    apply_fallbacks(outcome, token, refresh_token)
     post_summary(outcome, token, refresh_token)
-    return {"results": outcome["summaries"]}
+    return {"results": outcome["summaries"] + outcome["switched"]}
 
 
 # Registration for the next Sun-Sat week opens on Thursday at this time.
@@ -549,13 +646,72 @@ def day_command(text: str) -> Dict[str, Any]:
     return {"text": f"Arbox classes {format_day(date_str)}", "parts": day_parts(date_str, schedule)}
 
 
+def class_started(date_str: str, start_time: str) -> bool:
+    class_start = datetime.combine(
+        datetime.strptime(date_str, "%Y-%m-%d").date(), parse_hhmm(start_time), tzinfo=get_timezone()
+    )
+    return now_with_tz() >= class_start
+
+
+def switch_from_button(value: Dict[str, Any]) -> str:
+    """Handle a 'switch' button: book the new class first, then cancel the old one."""
+    date_str, start_time, schedule_id, old_schedule_id = value["d"], value["t"], value["s"], value["o"]
+    day = format_day(date_str)
+    if class_started(date_str, start_time):
+        return f"⌛ *{day} {start_time}* — that class already started."
+
+    auth = login_from_config()
+    token, refresh_token = auth["token"], auth["refresh_token"]
+    schedule = fetch_day_schedule(date_str, token, refresh_token)
+    new_entry = next((e for e in schedule if e.get("id") == schedule_id), None)
+    old_entry = next((e for e in schedule if e.get("id") == old_schedule_id), None)
+    old_time = old_entry.get("time") if old_entry else "?"
+    if new_entry is None:
+        return f"❌ *{day} {start_time}* — class no longer exists. Still booked {old_time}."
+    try:
+        enroll_schedule_entry(new_entry, token, refresh_token)
+    except ClassFullError:
+        return f"❌ *{day} {start_time}* — class is full now. Still booked {old_time}."
+
+    if old_entry and old_entry.get("user_booked"):
+        try:
+            cancel_booking(old_entry["user_booked"], old_schedule_id, token, refresh_token)
+        except Exception as exc:  # noqa: BLE001
+            return f"⚠️ *{day}* — booked {start_time} but couldn't cancel {old_time}: {exc}"
+    return f"🔁 *{day}* — switched {old_time} → {start_time}"
+
+
+def cancel_from_button(value: Dict[str, Any]) -> str:
+    """Handle a 'cancel' button: cancel the automatically booked class for that day."""
+    date_str, old_schedule_id = value["d"], value["o"]
+    day = format_day(date_str)
+    auth = login_from_config()
+    token, refresh_token = auth["token"], auth["refresh_token"]
+    schedule = fetch_day_schedule(date_str, token, refresh_token)
+    old_entry = next((e for e in schedule if e.get("id") == old_schedule_id), None)
+    if old_entry is None or not old_entry.get("user_booked"):
+        return f"ℹ️ *{day}* — that class isn't booked anymore."
+    if class_started(date_str, old_entry["time"]):
+        return f"⌛ *{day} {old_entry['time']}* — that class already started."
+    cancel_booking(old_entry["user_booked"], old_schedule_id, token, refresh_token)
+    return f"🗑️ *{day}* — {old_entry['time']} cancelled, not registered that day."
+
+
+def handle_button(value: Dict[str, Any]) -> str:
+    """Run a queued register / switch / cancel button press and return a status line."""
+    action = value.get("action", ACTION_REGISTER)
+    if action == ACTION_SWITCH:
+        return switch_from_button(value)
+    if action == ACTION_CANCEL:
+        return cancel_from_button(value)
+    return register_from_button(value)
+
+
 def register_from_button(value: Dict[str, Any]) -> str:
     """Handle a 'register' button (Slack or Telegram): book the chosen class and return a status line."""
     date_str, start_time, schedule_id = value["d"], value["t"], value["s"]
     day = format_day(date_str)
-    tz = get_timezone()
-    class_start = datetime.combine(datetime.strptime(date_str, "%Y-%m-%d").date(), parse_hhmm(start_time), tzinfo=tz)
-    if now_with_tz() >= class_start:
+    if class_started(date_str, start_time):
         return f"⌛ *{day} {start_time}* — that class already started."
 
     auth = login_from_config()

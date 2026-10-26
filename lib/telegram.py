@@ -37,9 +37,16 @@ def to_html(text: str) -> str:
 
 
 def button_data(button: Dict[str, Any]) -> str:
-    """Compact callback data (Telegram allows 64 bytes): r|date|time|schedule_id or s|date|time."""
+    """Compact callback data (Telegram allows 64 bytes).
+
+    r|date|time|schedule_id, s|date|time, w|date|time|schedule_id|old_schedule_id, c|date|old_schedule_id
+    """
     if button["action"] == "register":
         return f"r|{button['date']}|{button['time']}|{button['schedule_id']}"
+    if button["action"] == "switch":
+        return f"w|{button['date']}|{button['time']}|{button['schedule_id']}|{button['old_schedule_id']}"
+    if button["action"] == "cancel":
+        return f"c|{button['date']}|{button['old_schedule_id']}"
     return f"s|{button['date']}|{button['time']}"
 
 
@@ -47,6 +54,10 @@ def parse_button_data(data: str) -> Dict[str, Any]:
     parts = data.split("|")
     if parts[0] == "r" and len(parts) == 4:
         return {"action": "register", "d": parts[1], "t": parts[2], "s": int(parts[3])}
+    if parts[0] == "w" and len(parts) == 5:
+        return {"action": "switch", "d": parts[1], "t": parts[2], "s": int(parts[3]), "o": int(parts[4])}
+    if parts[0] == "c" and len(parts) == 3:
+        return {"action": "cancel", "d": parts[1], "o": int(parts[2])}
     if parts[0] == "s" and len(parts) == 3:
         return {"action": "skip", "d": parts[1], "r": parts[2]}
     raise ValueError(f"Unknown button data: {data}")
