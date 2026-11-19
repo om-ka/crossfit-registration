@@ -51,12 +51,23 @@ DAYS_TO_BOOK: List[Dict[str, str]] = [
 # Time coordination constants (Azure Function friendly)
 RUN_TIME = "15:00"
 
-# Classes sometimes open a bit late. Keep polling the requested classes for up
-# to CLASS_OPEN_WAIT_SEC before falling back to asking the user on Slack.
-CLASS_OPEN_WAIT_SEC = 30
-CLASS_POLL_INTERVAL_SEC = 2
+# Classes sometimes open a bit late, and Arbox rate-limits (429) bursts of calls,
+# so book one day at a time like a user would. First one pass over all days, then
+# retry rounds over the failed days: each day is tried with the round's delays,
+# then the next failed day. Round 1 waits 0.5/1/2s, round 2 1/2/3s, round 3 2/3/4s...
+# After SUMMARY_AFTER_SEC the summary (with buttons) is posted; retries continue
+# until FOLLOW_UP_UNTIL_SEC after the start and a follow-up is sent.
+SUMMARY_AFTER_SEC = 30
+FOLLOW_UP_UNTIL_SEC = 120
+FIRST_ROUND_DELAYS_SEC = [0.5, 1, 2]
+DAY_GAP_SEC = 0.5
 
-REGISTER_RETRY_DELAYS_SEC = [0.01, 0.1, 1.0, 2.0, 3.0]
+
+def round_delays(round_no: int) -> List[float]:
+    """Delays for retry round 1, 2, 3...: [0.5, 1, 2], [1, 2, 3], [2, 3, 4], ..."""
+    if round_no == 1:
+        return FIRST_ROUND_DELAYS_SEC
+    return [round_no - 1, round_no, round_no + 1]
 
 # When the requested class doesn't exist (holiday / changed schedule), book the
 # first later class within this many hours instead, skipping these class types.
@@ -72,6 +83,25 @@ ACTION_CANCEL = "cancel"
 
 class ClassFullError(RuntimeError):
     pass
+
+
+class ClassNotFoundError(RuntimeError):
+    pass
+
+
+class RateLimitedError(RuntimeError):
+    def __init__(self, retry_after: Optional[float] = None) -> None:
+        super().__init__("Rate limited by Arbox (429).")
+        self.retry_after = retry_after
+
+
+def check_rate_limit(resp: requests.Response) -> None:
+    if resp.status_code == 429:
+        try:
+            retry_after: Optional[float] = float(resp.headers.get("Retry-After", ""))
+        except ValueError:
+            retry_after = None
+        raise RateLimitedError(retry_after)
 
 
 def common_headers() -> Dict[str, str]:
@@ -142,6 +172,7 @@ def fetch_membership_user_id(token: str, refresh_token: str, box_id: int, member
     """Fetch membership user id from membership endpoint."""
     url = f"{MEMBERSHIP_URL_TEMPLATE.format(box_id=box_id, membership_type=membership_type)}/false?XDEBUG_SESSION_START=PHPSTORM"
     resp = requests.get(url, headers=auth_headers(token, refresh_token))
+    check_rate_limit(resp)
     resp.raise_for_status()
 
     payload = resp.json()
@@ -171,6 +202,7 @@ def fetch_day_schedule(
     }
 
     resp = requests.post(SCHEDULE_URL, headers=auth_headers(token, refresh_token), json=payload)
+    check_rate_limit(resp)
     resp.raise_for_status()
     return resp.json().get("data", []) or []
 
@@ -179,7 +211,7 @@ def find_class(schedule: List[Dict[str, Any]], start_time: str) -> Dict[str, Any
     for entry in schedule:
         if entry.get("time") == start_time and entry.get("id") is not None:
             return entry
-    raise RuntimeError(f"No class starting at {start_time} was found.")
+    raise ClassNotFoundError(f"No class starting at {start_time} was found.")
 
 
 def entry_box_id(entry: Dict[str, Any]) -> int:
@@ -195,33 +227,19 @@ def register_for_class(
         "extras": {"spot": None},
     }
 
-    last_error: Optional[Exception] = None
-    for attempt in range(len(REGISTER_RETRY_DELAYS_SEC) + 1):
-        try:
-            resp = requests.post(REGISTER_URL, headers=auth_headers(token, refresh_token), json=payload)
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-        else:
-            # 516 = class full; retrying won't help.
-            if resp.status_code == 516:
-                raise ClassFullError("Class is full (status 516).")
-            if resp.status_code == 200:
-                return resp.json()
-            try:
-                error_message = resp.json().get("error", {}).get("messageToUser")
-            except Exception:  # noqa: BLE001
-                error_message = resp.text
-            last_error = RuntimeError(f"Registration failed ({resp.status_code}): {error_message}")
-
-        if attempt < len(REGISTER_RETRY_DELAYS_SEC):
-            delay = REGISTER_RETRY_DELAYS_SEC[attempt]
-            print(
-                f"Registration attempt {attempt + 1} failed: {last_error}. "
-                f"Retrying in {int(delay * 1000)}ms."
-            )
-            time.sleep(delay)
-
-    raise last_error  # type: ignore[misc]
+    # Single attempt: retry_rounds retries, so no fast retry burst here.
+    resp = requests.post(REGISTER_URL, headers=auth_headers(token, refresh_token), json=payload)
+    check_rate_limit(resp)
+    # 516 = class full; retrying won't help.
+    if resp.status_code == 516:
+        raise ClassFullError("Class is full (status 516).")
+    if resp.status_code == 200:
+        return resp.json()
+    try:
+        error_message = resp.json().get("error", {}).get("messageToUser")
+    except Exception:  # noqa: BLE001
+        error_message = resp.text
+    raise RuntimeError(f"Registration failed ({resp.status_code}): {error_message}")
 
 
 def cancel_booking(schedule_user_id: int, schedule_id: int, token: str, refresh_token: str) -> None:
@@ -327,6 +345,17 @@ def get_days_to_book() -> List[Dict[str, str]]:
     return DAYS_TO_BOOK
 
 
+_membership_cache: Dict[tuple, int] = {}
+
+
+def cached_membership_user_id(token: str, refresh_token: str, box_id: int, membership_type: int) -> int:
+    """The membership id doesn't change during a run; fetch it once per login."""
+    key = (token, box_id, membership_type)
+    if key not in _membership_cache:
+        _membership_cache[key] = fetch_membership_user_id(token, refresh_token, box_id, membership_type)
+    return _membership_cache[key]
+
+
 def enroll_schedule_entry(
     entry: Dict[str, Any], token: str, refresh_token: str, membership_type: int = DEFAULT_MEMBERSHIP_TYPE
 ) -> Dict[str, Any]:
@@ -337,7 +366,7 @@ def enroll_schedule_entry(
         print(f"Already booked for schedule_id={schedule_id}.")
         return {**summary, "already_booked": True}
 
-    membership_user_id = fetch_membership_user_id(token, refresh_token, entry_box_id(entry), membership_type)
+    membership_user_id = cached_membership_user_id(token, refresh_token, entry_box_id(entry), membership_type)
     print(f"Registering schedule_id={schedule_id} with membership id {membership_user_id} ...")
     result = register_for_class(schedule_id, membership_user_id, token, refresh_token)
     print(f"Registration successful: {result}")
@@ -355,33 +384,20 @@ def run_enrollment(date_str: str, start_time: str, token: str, refresh_token: st
 
 
 def enroll_all(targets: List[tuple], token: str, refresh_token: str) -> Dict[str, Any]:
-    """Enroll all targets, polling round-robin for late-opening classes.
+    """One attempt per day, one day at a time.
 
     Returns {"summaries": [...], "failures": {(date, time): error}}.
     """
     summaries: List[Dict[str, Any]] = []
-    pending: Dict[tuple, Exception] = {t: RuntimeError("not attempted") for t in targets}
     failures: Dict[tuple, Exception] = {}
-    deadline = time.monotonic() + CLASS_OPEN_WAIT_SEC
-
-    while pending:
-        for target in list(pending):
-            date_str, start_time = target
-            try:
-                summaries.append(run_enrollment(date_str, start_time, token, refresh_token))
-                del pending[target]
-            except ClassFullError as exc:
-                # Waiting won't help a full class.
-                failures[target] = exc
-                del pending[target]
-            except Exception as exc:  # noqa: BLE001
-                pending[target] = exc
-                print(f"{date_str} {start_time} not available yet: {exc}")
-        if not pending or time.monotonic() >= deadline:
-            break
-        time.sleep(CLASS_POLL_INTERVAL_SEC)
-
-    failures.update(pending)
+    for i, (date_str, start_time) in enumerate(targets):
+        if i:
+            time.sleep(DAY_GAP_SEC)
+        try:
+            summaries.append(run_enrollment(date_str, start_time, token, refresh_token))
+        except Exception as exc:  # noqa: BLE001
+            failures[(date_str, start_time)] = exc
+            print(f"{date_str} {start_time} failed: {exc}")
     return {"summaries": summaries, "failures": failures}
 
 
@@ -407,8 +423,9 @@ def apply_fallbacks(outcome: Dict[str, Any], token: str, refresh_token: str) -> 
     """For classes that don't exist, book the next suitable class that day (moved to outcome["switched"])."""
     outcome["switched"] = []
     for (date_str, start_time), exc in list(outcome["failures"].items()):
-        if isinstance(exc, ClassFullError):
-            continue  # The class exists; ask instead of guessing.
+        if not isinstance(exc, ClassNotFoundError):
+            continue  # The class exists (full, rate limited, ...); ask instead of guessing.
+        time.sleep(DAY_GAP_SEC)
         try:
             schedule = fetch_day_schedule(date_str, token, refresh_token)
             fallback = pick_fallback(schedule, start_time)
@@ -553,6 +570,92 @@ def post_summary(outcome: Dict[str, Any], token: str, refresh_token: str) -> Non
     send_message({"text": text, "parts": parts})
 
 
+def follow_up_attempt(date_str: str, start_time: str, token: str, refresh_token: str) -> Dict[str, Any]:
+    """Book the requested class unless the user already booked something that day from the buttons."""
+    schedule = fetch_day_schedule(date_str, token, refresh_token)
+    booked = [e for e in schedule if e.get("user_booked")]
+    if booked and not any(e.get("time") == start_time for e in booked):
+        return {"date": date_str, "start_time": start_time, "chosen": booked[0].get("time")}
+    summary = enroll_schedule_entry(find_class(schedule, start_time), token, refresh_token)
+    summary.update(date=date_str, start_time=start_time)
+    return summary
+
+
+def retry_rounds(outcome: Dict[str, Any], token: str, refresh_token: str, started: float) -> None:
+    """Retry failed days in rounds; post the summary at SUMMARY_AFTER_SEC and a follow-up at the end."""
+    summary_sent = False
+    retried: List[tuple] = []  # failed days still open when the summary was sent
+    results: Dict[tuple, str] = {}
+
+    def send_summary() -> None:
+        nonlocal summary_sent
+        apply_fallbacks(outcome, token, refresh_token)
+        post_summary(outcome, token, refresh_token)
+        summary_sent = True
+        retried.extend(t for t, exc in sorted(outcome["failures"].items()) if not isinstance(exc, ClassFullError))
+
+    def pending() -> List[tuple]:
+        return [
+            t for t, exc in sorted(outcome["failures"].items())
+            if not isinstance(exc, ClassFullError) and t not in results
+        ]
+
+    round_no = 0
+    while pending() and time.monotonic() < started + FOLLOW_UP_UNTIL_SEC:
+        round_no += 1
+        for target in pending():
+            date_str, start_time = target
+            for delay in round_delays(round_no):
+                time.sleep(delay)
+                if time.monotonic() >= started + FOLLOW_UP_UNTIL_SEC:
+                    break
+                if not summary_sent and time.monotonic() >= started + SUMMARY_AFTER_SEC:
+                    send_summary()
+                    if target not in pending():
+                        break  # booked at another time by the fallback
+                try:
+                    if summary_sent:
+                        # The user may have picked a class from the buttons; never override it.
+                        result = follow_up_attempt(date_str, start_time, token, refresh_token)
+                    else:
+                        result = run_enrollment(date_str, start_time, token, refresh_token)
+                except ClassFullError as exc:
+                    outcome["failures"][target] = exc
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    outcome["failures"][target] = exc
+                    print(f"Round {round_no}: {date_str} {start_time} failed: {exc}")
+                    continue
+                if summary_sent:
+                    results[target] = result.get("chosen") or "registered"
+                else:
+                    outcome["summaries"].append(result)
+                    del outcome["failures"][target]
+                break
+            if target in outcome["failures"] and target not in results:
+                time.sleep(DAY_GAP_SEC)
+
+    if not summary_sent:
+        send_summary()
+        return
+    if not retried:
+        return
+
+    lines = []
+    for date_str, start_time in retried:
+        day = f"*{format_day(date_str)} {start_time}*"
+        result = results.get((date_str, start_time))
+        if result == "registered":
+            lines.append(f"✅ {day} — registered on retry. Ignore the buttons above for that day.")
+        elif result:
+            lines.append(f"👍 {day} — you picked {result}, leaving it.")
+        else:
+            exc = outcome["failures"].get((date_str, start_time))
+            lines.append(f"⚠️ {day} — still not booked ({exc}). Use the buttons above.")
+    text = "Arbox follow-up: " + ", ".join(f"{format_day(d)} {t}" for d, t in retried)
+    send_message({"text": text, "parts": [part("🔁 *Follow-up*\n" + "\n".join(lines))]})
+
+
 def run_coordinated_flow() -> Dict[str, Any]:
     """Wait until run time, enroll all configured classes and post a summary."""
     # SKIP_TIME_CHECK=true (testing) runs immediately instead of waiting for RUN_TIME.
@@ -579,9 +682,9 @@ def run_coordinated_flow() -> Dict[str, Any]:
         target_date = next_date_for_weekday(idx, today)
         targets.append((target_date, start_time))
 
+    started = time.monotonic()
     outcome = enroll_all(targets, token, refresh_token)
-    apply_fallbacks(outcome, token, refresh_token)
-    post_summary(outcome, token, refresh_token)
+    retry_rounds(outcome, token, refresh_token, started)
     return {"results": outcome["summaries"] + outcome["switched"]}
 
 
